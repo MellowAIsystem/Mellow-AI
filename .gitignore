@@ -1,0 +1,73 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# Node/JS
+node_modules/
+dist/
+build/
+
+# Editor
+
+# 1. Generate SSH key (press Enter through prompts)
+ssh-keygen -t ed25519 -C "aimellow.assistant@gmail.com"
+
+# 2. Start the SSH agent
+eval "$(ssh-agent -s)"
+
+# 3. Add your new key to the agent
+ssh-add ~/.ssh/id_ed25519
+
+# 4. Show your public key (copy this!)
+cat ~/.ssh/id_ed25519.pub
+cat ~/.ssh/id_ed25519.pub
+
+ssh-ed25519 AAAAC3Nz...xyz aimellow.assistant@gmail.com
+
+# 1) Make sure the key is loaded in the SSH agent
+eval "$(ssh-agent -s)"
+ssh-add -l || true
+ssh-add ~/.ssh/id_ed25519
+
+# 2) Check file permissions (SSH refuses weak perms)
+chmod 700 ~/.ssh
+chmod 600 ~/.ssh/id_ed25519
+chmod 644 ~/.ssh/id_ed25519.pub
+
+# 3) Verify the key on GitHub is the SAME as your local pub key
+echo "LOCAL KEY:" && cat ~/.ssh/id_ed25519.pub
+
+# 4) Test the SSH connection to GitHub (say 'yes' if it asks to add host)
+ssh -T git@github.com
+
+# 5) Ensure your repo uses SSH, not HTTPS
+cd /Users/paulcourbet/Mellow
+git remote set-url origin git@github.com:MellowAIsystem/Mellow-AI.git
+git remote -v
+
+# 6) Push
+git push -u origin main
+# 0) Make sure you're in a good state
+cd ~
+eval "$(ssh-agent -s)"
+
+# 1) Create an SSH config so macOS uses your key automatically
+mkdir -p ~/.ssh
+chmod 700 ~/.ssh
+cat > ~/.ssh/config << 'EOF'
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed25519
+  AddKeysToAgent yes
+  UseKeychain yes

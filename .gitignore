@@ -71,3 +71,5 @@ Host github.com
   IdentityFile ~/.ssh/id_ed25519
   AddKeysToAgent yes
   UseKeychain yes
+*.backup.py
+Mellow-AI/

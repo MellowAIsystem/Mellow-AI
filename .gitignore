@@ -73,3 +73,7 @@ Host github.com
   UseKeychain yes
 *.backup.py
 Mellow-AI/
+
+# editor leftovers
+*.rtf
+*.backup.py

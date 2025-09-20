@@ -1,8 +1,9 @@
-import os, sys, glob, datetime, queue, threading, time, wave, subprocess
+import os, sys, glob, wave, datetime, queue, threading, subprocess, json, time
 import tkinter as tk
+from tkinter import ttk, messagebox
 import numpy as np
 
-# ---- Audio backend -----------------------------------------------------------
+# Optional mic backend
 try:
     import sounddevice as sd
     _IMPORT_ERR = None
@@ -10,380 +11,559 @@ except Exception as e:
     sd = None
     _IMPORT_ERR = e
 
-MENU_ITEMS = ["Discussion", "Voices", "Bluetooth", "Devices", "Logs", "Settings"]
-REC_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "voice_input", "recordings")
-)
+# -----------------------
+# Paths & constants
+# -----------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REC_DIR = os.path.join(PROJECT_ROOT, "software", "voice_input", "recordings")
+os.makedirs(REC_DIR, exist_ok=True)
 
-# ---- Recorder ---------------------------------------------------------------
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "software", "system_tools")
+os.makedirs(CONFIG_DIR, exist_ok=True)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "mellow_config.json")
+
+MENU_ITEMS = ["Discussion", "Voices", "Bluetooth", "Devices", "Logs", "Settings"]
+
+AUTOSAVE_INTERVAL_SEC = 15  # snapshot cadence during recording
+DEFAULT_SR = 16000
+DEFAULT_CH = 1
+DEFAULT_DTYPE = "float32"
+
+# -----------------------
+# Small helpers
+# -----------------------
+def iso_now():
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "device_index": None,   # sounddevice index
+        "samplerate": DEFAULT_SR,
+        "channels": DEFAULT_CH,
+        "dtype": DEFAULT_DTYPE,
+    }
+
+def save_config(cfg):
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+def list_input_devices():
+    if sd is None:
+        return []
+    try:
+        devs = sd.query_devices()
+        out = []
+        for i, d in enumerate(devs):
+            if d.get("max_input_channels", 0) > 0:
+                out.append({
+                    "index": i,
+                    "name": d.get("name", f"Device {i}"),
+                    "hostapi": d.get("hostapi", None),
+                    "sr_default": int(d.get("default_samplerate", DEFAULT_SR)),
+                    "max_in": int(d.get("max_input_channels", 0)),
+                })
+        return out
+    except Exception:
+        return []
+
+def latest_wav():
+    files = glob.glob(os.path.join(REC_DIR, "REC-*.wav"))
+    if not files: return None
+    return sorted(files, key=os.path.getmtime, reverse=True)[0]
+
+def play_wav(path):
+    if not path or not os.path.exists(path): return
+    if sys.platform == "darwin":
+        subprocess.Popen(["afplay", path])
+    elif sys.platform.startswith("linux"):
+        subprocess.Popen(["paplay", path])  # or "aplay" depending on system
+    else:
+        messagebox.showinfo("Play", f"Please open manually:\n{path}")
+
+# -----------------------
+# Recorder
+#   float32 capture -> int16 WAV on save
+#   autosave snapshots every AUTOSAVE_INTERVAL_SEC
+# -----------------------
 class Recorder:
-    """Simple WAV recorder; auto-detects device sample rate if not provided."""
-    def __init__(self, samplerate=None, channels=1, dtype="int16"):
-        self.samplerate = samplerate
-        self.channels = channels
+    def __init__(self, samplerate, channels, dtype, device_index=None):
+        self.samplerate = int(samplerate)
+        self.channels = int(channels)
         self.dtype = dtype
+        self.device_index = device_index
+
         self.q = queue.Queue()
-        self.stream = None
-        self.frames = []
-        self.filepath = None
-        self.worker = None
-        self.level_rms = 0.0  # 0..1 approx
+        self.frames_f32 = []     # list of float32 frames (numpy arrays)
+        self.running = False
+        self.start_ts = None
+
+        self.autosave_thread = None
+        self.autosave_stop = threading.Event()
+        self.take_basename = None  # e.g., REC-20250919-142233
 
     def _callback(self, indata, frames, time_info, status):
         if status:
-            # Prints glitch/overflow info; helpful for debugging
-            print("sounddevice status:", status, flush=True)
-        # Keep a copy of raw audio
-        block = indata.copy()
-        self.q.put(block)
+            # Dropouts etc; we still store what we get
+            pass
+        if self.running:
+            self.q.put(indata.copy())
 
-        # Update instantaneous RMS level (thread-safe enough for reading)
-        try:
-            arr = block.astype(np.float32)
-            # Normalize based on dtype (int16 most common)
-            if self.dtype == "int16":
-                arr /= 32768.0
-            rms = float(np.sqrt(np.mean(arr * arr)) if arr.size else 0.0)
-            # Clamp to [0, 1.5] then to [0,1] for a bit of headroom
-            self.level_rms = max(0.0, min(rms / 1.0, 1.0))
-        except Exception:
-            self.level_rms = 0.0
+    def start(self):
+        if sd is None:
+            raise RuntimeError(f"sounddevice import error: {_IMPORT_ERR}")
+        self.frames_f32.clear()
+        self.q.queue.clear()
+        self.running = True
+        self.start_ts = time.time()
+        self.take_basename = datetime.datetime.now().strftime("REC-%Y%m%d-%H%M%S")
 
-    def start(self, out_dir=REC_DIR):
-        os.makedirs(out_dir, exist_ok=True)
-        if self.samplerate is None and sd:
-            in_dev = sd.default.device[0]
-            info = sd.query_devices(in_dev)
-            self.samplerate = int(info.get("default_samplerate", 48000) or 48000)
-
-        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.filepath = os.path.join(out_dir, f"REC-{ts}.wav")
-        self.frames = []
-        self.level_rms = 0.0
-
+        # Open input stream
         self.stream = sd.InputStream(
             samplerate=self.samplerate,
             channels=self.channels,
             dtype=self.dtype,
+            device=self.device_index,
             callback=self._callback,
         )
         self.stream.start()
-        self.worker = threading.Thread(target=self._drain, daemon=True)
-        self.worker.start()
-        return self.filepath
 
-    def _drain(self):
-        while self.stream and self.stream.active:
-            try:
-                block = self.q.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            self.frames.append(block)
+        # Autosave snapshots
+        self.autosave_stop.clear()
+        self.autosave_thread = threading.Thread(target=self._autosave_worker, daemon=True)
+        self.autosave_thread.start()
 
     def stop(self):
-        if not self.stream:
-            return None
-        self.stream.stop()
-        self.stream.close()
-        self.stream = None
-        if not self.frames:
-            return None
+        if not self.running:
+            return None, None
+        self.running = False
 
-        audio = np.concatenate(self.frames, axis=0)
-        with wave.open(self.filepath, "wb") as wf:
+        # drain queue
+        while not self.q.empty():
+            self.frames_f32.append(self.q.get())
+
+        # stop input stream
+        try:
+            self.stream.stop()
+            self.stream.close()
+        except Exception:
+            pass
+
+        # stop autosave
+        self.autosave_stop.set()
+        if self.autosave_thread and self.autosave_thread.is_alive():
+            self.autosave_thread.join(timeout=2)
+
+        # consolidate and write final WAV + sidecar
+        wav_path = os.path.join(REC_DIR, f"{self.take_basename}.wav")
+        sidecar_path = os.path.join(REC_DIR, f"{self.take_basename}.json")
+        duration = self._write_wav(wav_path)
+        self._write_sidecar(sidecar_path, wav_path, duration, autosave=False)
+
+        # clean autosaves
+        for apath in glob.glob(os.path.join(REC_DIR, f"AUTOSAVE-{self.take_basename}-*.wav")):
+            try: os.remove(apath)
+            except Exception: pass
+
+        return wav_path, duration
+
+    def poll_into_buffer(self):
+        """Pull queued chunks into frames_f32; return (sec, rms) for UI."""
+        while True:
+            try:
+                self.frames_f32.append(self.q.get_nowait())
+            except queue.Empty:
+                break
+        elapsed = (time.time() - self.start_ts) if self.start_ts else 0.0
+        if self.frames_f32:
+            latest = self.frames_f32[-1]
+            latest_i16 = np.clip(latest, -1.0, 1.0)
+            latest_i16 = (latest_i16 * 32767).astype(np.int16)
+            rms = float(np.sqrt(np.mean(latest_i16.astype(np.float32) ** 2))) / 32767.0
+        else:
+            rms = 0.0
+        return elapsed, rms
+
+    def _write_wav(self, out_path, frames_override=None):
+        """Write float32 frames as int16 WAV; return duration seconds."""
+        frames = frames_override if frames_override is not None else self.frames_f32
+        if not frames:
+            with wave.open(out_path, "wb") as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(2)
+                wf.setframerate(self.samplerate)
+            return 0.0
+
+        pcm = np.concatenate(frames, axis=0)
+        pcm = np.clip(pcm, -1.0, 1.0)
+        pcm_i16 = (pcm * 32767).astype(np.int16)
+
+        with wave.open(out_path, "wb") as wf:
             wf.setnchannels(self.channels)
             wf.setsampwidth(2)  # int16
             wf.setframerate(self.samplerate)
-            wf.writeframes(audio.astype(np.int16).tobytes())
-        return self.filepath
+            wf.writeframes(pcm_i16.tobytes())
 
-    def get_level(self) -> float:
-        return float(self.level_rms or 0.0)
+        return pcm_i16.shape[0] / float(self.samplerate)
 
+    def _write_sidecar(self, sidecar_path, wav_path, duration_sec, autosave: bool):
+        meta = {
+            "filename": os.path.basename(wav_path),
+            "path": wav_path,
+            "created_at": iso_now(),
+            "samplerate": self.samplerate,
+            "channels": self.channels,
+            "dtype": self.dtype,
+            "frames": int(duration_sec * self.samplerate),
+            "duration_sec": float(duration_sec),
+            "device_index": self.device_index,
+            "device_name": None,
+            "autosave": autosave,
+        }
+        for d in list_input_devices():
+            if d["index"] == self.device_index:
+                meta["device_name"] = d["name"]
+                break
 
-# ---- App UI -----------------------------------------------------------------
+        tmp = sidecar_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp, sidecar_path)
+
+    def _autosave_worker(self):
+        last_dump = 0.0
+        while not self.autosave_stop.is_set():
+            now = time.time()
+            if now - last_dump >= AUTOSAVE_INTERVAL_SEC:
+                frames_copy = list(self.frames_f32)
+                name = f"AUTOSAVE-{self.take_basename}-{int(now - self.start_ts):04d}s.wav"
+                path = os.path.join(REC_DIR, name)
+                dur = self._write_wav(path, frames_override=frames_copy)
+                sidecar = path.replace(".wav", ".json")
+                self._write_sidecar(sidecar, path, dur, autosave=True)
+                last_dump = now
+            time.sleep(0.2)
+
+# -----------------------
+# UI App
+# -----------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Mellow UI (Mic capture build)")
-        self.geometry("960x560")
-        self.configure(bg="#111")
+        self.title("Mellow UI (offline)")
+        self.geometry("860x560")
 
-        self.is_recording = False
-        self.record_start_ts: float | None = None
-        self.recorder = Recorder() if sd else None
+        self.cfg = load_config()
+        self.recorder = None
+        self.recording = False
 
-        self.columnconfigure(1, weight=1)
-        self.rowconfigure(1, weight=1)
+        self._build_layout()
+        self._refresh_logs()
+        self._tick()  # periodic UI updates
 
+    # ----- UI Layout -----
+    def _build_layout(self):
         # Top bar
-        top = tk.Frame(self, bg="#0c0c0c", height=56)
-        top.grid(row=0, column=0, columnspan=2, sticky="nsew")
-        top.grid_propagate(False)
+        top = ttk.Frame(self, padding=(10, 8))
+        top.pack(side=tk.TOP, fill=tk.X)
 
-        tk.Label(top, text="Mellow", fg="#f2f2f2", bg="#0c0c0c",
-                 font=("Helvetica", 18, "bold")).pack(side="left", padx=16)
+        self.btn_record = ttk.Button(top, text="● Record", command=self._on_record)
+        self.btn_record.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Level meter (simple horizontal bar)
-        meter_wrap = tk.Frame(top, bg="#0c0c0c")
-        meter_wrap.pack(side="right", padx=(0, 12))
-        self.level_canvas = tk.Canvas(meter_wrap, width=140, height=12,
-                                      bg="#1e1e1e", highlightthickness=0)
-        self.level_canvas.pack(side="left")
-        self.level_rect = self.level_canvas.create_rectangle(0, 0, 1, 12, fill="#2ecc71", width=0)
+        self.btn_stop = ttk.Button(top, text="■ Stop", command=self._on_stop, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Timer label
-        self.timer_lbl = tk.Label(top, text="00:00", fg="#cfcfcf", bg="#0c0c0c",
-                                  font=("Helvetica", 13, "bold"))
-        self.timer_lbl.pack(side="right", padx=(0, 12))
+        self.lbl_timer = ttk.Label(top, text="00:00")
+        self.lbl_timer.pack(side=tk.LEFT, padx=(8, 16))
 
-        # Record/Stop
-        self.rec_btn = tk.Button(top, text="●  Record", fg="#fff", bg="#333",
-                                 activebackground="#444", relief="flat",
-                                 padx=14, pady=8, command=self.toggle_recording)
-        self.rec_btn.pack(side="right", padx=(0, 16), pady=8)
+        self.rms_var = tk.DoubleVar(value=0.0)
+        self.rms_bar = ttk.Progressbar(top, orient="horizontal", length=180, mode="determinate", variable=self.rms_var, maximum=1.0)
+        self.rms_bar.pack(side=tk.LEFT, padx=(0, 12))
 
-        # Sidebar
-        sidebar = tk.Frame(self, bg="#1a1a1a", width=220)
-        sidebar.grid(row=1, column=0, sticky="ns")
-        sidebar.grid_propagate(False)
+        ttk.Separator(top, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
-        self.menu = tk.Listbox(
-            sidebar, activestyle="none", highlightthickness=0,
-            fg="#e0e0e0", bg="#1a1a1a", selectbackground="#333",
-            selectforeground="#fff", border=0, height=16
-        )
-        for item in MENU_ITEMS:
-            self.menu.insert(tk.END, f"  {item}")
-        self.menu.pack(fill="both", expand=True, padx=8, pady=(16, 8))
-        self.menu.bind("<<ListboxSelect>>", self.on_select)
+        self.btn_play_last = ttk.Button(top, text="▶ Play last", command=self._on_play_last)
+        self.btn_play_last.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Content area (we’ll swap widgets depending on tab)
-        self.content = tk.Frame(self, bg="#0f0f0f")
-        self.content.grid(row=1, column=1, sticky="nsew")
-        self.content.grid_columnconfigure(0, weight=1)
-        self.content.grid_rowconfigure(0, weight=1)
+        # status
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(top, textvariable=self.status_var, foreground="#666").pack(side=tk.RIGHT)
 
-        self.title_lbl = tk.Label(self.content, text="Welcome to Mellow",
-                                  bg="#0f0f0f", fg="#fafafa",
-                                  font=("Helvetica", 20, "bold"))
-        self.title_lbl.pack(pady=24)
+        # Sidebar + content
+        body = ttk.Frame(self)
+        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        self.body = tk.Label(self.content, text="", bg="#0f0f0f",
-                             fg="#c9c9c9", justify="left",
-                             font=("Helvetica", 12), anchor="nw")
-        self.body.pack(padx=24, anchor="nw")
+        sidebar = ttk.Frame(body, width=180)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y)
+        sidebar.pack_propagate(False)
 
-        # Logs view (created/destroyed on demand)
-        self.logs_view = None
+        self.content = ttk.Frame(body, padding=(10, 10))
+        self.content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Play last button (top bar helper)
-        self.play_btn = tk.Button(
-            top, text="▶ Play last", bg="#444444", fg="#FFFFFF",
-            activebackground="#555555", command=self.play_last
-        )
-        self.play_btn.pack(side="right", padx=8, pady=8)
+        # Sidebar buttons
+        self.tab_var = tk.StringVar(value="Discussion")
+        for m in MENU_ITEMS:
+            b = ttk.Radiobutton(sidebar, text=m, value=m, variable=self.tab_var, command=self._render_tab)
+            b.pack(anchor="w", padx=10, pady=6)
 
-        # Initial screen
-        self.menu.selection_set(0)
-        self.on_select(None)
+        self._render_tab()
 
-        # Periodic UI updater for timer + meter
-        self.after(100, self._update_ui)
+    # ----- Tabs -----
+    def _render_tab(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+        tab = self.tab_var.get()
 
-    # --- Recording controls ---------------------------------------------------
-    def toggle_recording(self):
-        if not sd:
-            self.set_status(f"Mic backend missing: pip install sounddevice (error: {_IMPORT_ERR})")
-            return
-
-        if not self.is_recording:
-            try:
-                path = self.recorder.start(REC_DIR)
-                self.record_start_ts = time.time()
-            except Exception as e:
-                self.set_status(
-                    "Failed to access microphone. Allow mic for Terminal/Python in "
-                    "System Settings → Privacy & Security → Microphone.\n\nError: " + str(e)
-                )
-                return
-            self.is_recording = True
-            self.rec_btn.configure(text="■  Stop", bg="#b30000")
-            self.set_status(f"Recording… Saving to:\n{path}")
+        if tab == "Discussion":
+            ttk.Label(self.content, text="Status: Ready. Tips: click ● Record to start; ■ Stop to save.", wraplength=560).pack(anchor="w")
+        elif tab == "Logs":
+            self._build_logs_tab()
+        elif tab == "Devices":
+            self._build_devices_tab()
         else:
-            path = self.recorder.stop()
-            self.is_recording = False
-            self.record_start_ts = None
-            self.rec_btn.configure(text="●  Record", bg="#333")
-            self.set_status(f"Stopped. Saved:\n{path}" if path else "Stopped. (No audio captured)")
+            ttk.Label(self.content, text=f"{tab} (placeholder)").pack(anchor="w")
 
-    def _update_ui(self):
-        # Timer
-        if self.is_recording and self.record_start_ts:
-            elapsed = int(time.time() - self.record_start_ts)
-            mm, ss = divmod(elapsed, 60)
-            self.timer_lbl.config(text=f"{mm:02d}:{ss:02d}")
-        else:
-            self.timer_lbl.config(text="00:00")
+    def _build_logs_tab(self):
+        top = ttk.Frame(self.content)
+        top.pack(fill=tk.X)
 
-        # Level meter
-        level = self.recorder.get_level() if (self.is_recording and self.recorder) else 0.0
-        width = max(1, int(140 * max(0.0, min(level, 1.0))))
-        self.level_canvas.coords(self.level_rect, 0, 0, width, 12)
+        self.btn_refresh = ttk.Button(top, text="Refresh", command=self._refresh_logs)
+        self.btn_refresh.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Schedule next tick
-        self.after(100, self._update_ui)
+        self.btn_play_sel = ttk.Button(top, text="Play selected", command=self._on_play_selected)
+        self.btn_play_sel.pack(side=tk.LEFT, padx=(0, 6))
 
-    # --- Playback helpers -----------------------------------------------------
-    def play_last(self):
-        """Play the most recent REC-*.wav using the OS player."""
-        try:
-            paths = sorted(
-                glob.glob(os.path.join(REC_DIR, "REC-*.wav")),
-                key=os.path.getmtime,
-                reverse=True,
-            )
-            if not paths:
-                self.set_status("No recordings yet.")
-                return
-            path = paths[0]
-            self.set_status(f"Playing: {os.path.basename(path)}")
-            if sys.platform == "darwin":
-                subprocess.Popen(["afplay", path])
-            elif sys.platform.startswith("win"):
-                os.startfile(path)  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["aplay", path])
-        except Exception as e:
-            self.set_status(f"Couldn't play file: {e}")
+        self.btn_reveal = ttk.Button(top, text="Reveal in Finder", command=self._on_reveal_selected)
+        self.btn_reveal.pack(side=tk.LEFT, padx=(0, 6))
 
-    # --- Screens --------------------------------------------------------------
-    def set_status(self, msg: str):
-        # Update only when the 'Discussion' screen is visible
-        if self.menu.curselection() and MENU_ITEMS[self.menu.curselection()[0]] == "Discussion":
-            self.body.config(text=msg + "\n\n" + self.render_screen("Discussion"))
-        else:
-            self.body.config(text=msg + "\n\nOpen 'Discussion' to view status.")
+        # NEW: Transcribe selected (offline)
+        self.btn_transcribe = ttk.Button(top, text="Transcribe selected (offline)", command=self._on_transcribe_selected)
+        self.btn_transcribe.pack(side=tk.LEFT, padx=(0, 6))
 
-    def on_select(self, _):
-        idx = self.menu.curselection()
-        if not idx:
+        # listbox
+        self.logs_list = tk.Listbox(self.content, height=18)
+        self.logs_list.pack(fill=tk.BOTH, expand=True, pady=(8,0))
+
+        self._refresh_logs()
+
+    def _refresh_logs(self):
+        if not hasattr(self, "logs_list"):
             return
-        name = MENU_ITEMS[idx[0]]
-        self.title_lbl.config(text=name)
-
-        # Swap logs view in/out
-        if name == "Logs":
-            self._show_logs_view()
-            return
-        else:
-            self._destroy_logs_view()
-
-        # Default label content for other tabs
-        self.body.config(text=self.render_screen(name))
-
-    def render_screen(self, name: str) -> str:
-        if name == "Discussion":
-            return "\n".join([
-                f"• Files save under: {REC_DIR}",
-                "• Uses your mic’s native sample rate automatically.",
-            ])
-        if name == "Voices":     return "Choose the speaking voice (placeholder)."
-        if name == "Bluetooth":  return "Pair headphones/speakers (placeholder)."
-        if name == "Devices":    return "Manage connected devices (placeholder)."
-        if name == "Logs":       return ""  # handled by _show_logs_view
-        if name == "Settings":   return "General settings (placeholder)."
-        return ""
-
-    # --- Logs tab -------------------------------------------------------------
-    def _show_logs_view(self):
-        if self.logs_view:
-            self._refresh_logs_list()
-            return
-
-        # Hide the label body when logs are shown
-        self.body.pack_forget()
-
-        vf = tk.Frame(self.content, bg="#0f0f0f")
-        vf.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self.logs_view = vf
-
-        # List of recent wavs
-        self.logs_list = tk.Listbox(vf, activestyle="none", height=12,
-                                    fg="#e0e0e0", bg="#171717",
-                                    selectbackground="#333", selectforeground="#fff",
-                                    border=0)
-        self.logs_list.pack(fill="both", expand=True, side="top")
-        self.logs_list.bind("<Double-1>", self._play_selected)
-
-        # Buttons
-        btns = tk.Frame(vf, bg="#0f0f0f")
-        btns.pack(fill="x", pady=12)
-        tk.Button(btns, text="▶ Play selected", bg="#444", fg="#fff",
-                  activebackground="#555", relief="flat",
-                  command=self._play_selected).pack(side="left", padx=(0, 8))
-        tk.Button(btns, text="Open folder", bg="#444", fg="#fff",
-                  activebackground="#555", relief="flat",
-                  command=self._open_folder).pack(side="left")
-
-        self._refresh_logs_list()
-
-    def _destroy_logs_view(self):
-        if self.logs_view:
-            self.logs_view.destroy()
-            self.logs_view = None
-            # restore the body label
-            self.body.pack(padx=24, anchor="nw")
-
-    def _refresh_logs_list(self):
-        if not self.logs_view:
-            return
-        paths = sorted(glob.glob(os.path.join(REC_DIR, "REC-*.wav")),
-                       key=os.path.getmtime, reverse=True)[:30]
-        self._log_paths = paths  # keep mapping
         self.logs_list.delete(0, tk.END)
-        for p in paths:
-            meta = self._wav_meta(p)
-            self.logs_list.insert(tk.END, f"{os.path.basename(p)}  —  {meta}")
+        files = sorted(
+            glob.glob(os.path.join(REC_DIR, "REC-*.wav")) +
+            glob.glob(os.path.join(REC_DIR, "AUTOSAVE-*.wav")),
+            key=os.path.getmtime, reverse=True
+        )
+        for f in files:
+            size_mb = os.path.getsize(f) / (1024*1024.0)
+            ts = datetime.datetime.fromtimestamp(os.path.getmtime(f)).strftime("%Y-%m-%d %H:%M:%S")
+            self.logs_list.insert(tk.END, f"{os.path.basename(f)}   ({size_mb:.2f} MB, {ts})")
 
-    def _wav_meta(self, path: str) -> str:
-        """Return short info like '48kHz · 00:03'."""
-        try:
-            with wave.open(path, "rb") as wf:
-                fr = wf.getframerate()
-                n = wf.getnframes()
-                dur = int(n / max(1, fr))
-                mm, ss = divmod(dur, 60)
-                return f"{fr//1000}kHz · {mm:02d}:{ss:02d}"
-        except Exception:
-            return "unknown"
+    def _build_devices_tab(self):
+        wrap = ttk.Frame(self.content)
+        wrap.pack(fill=tk.BOTH, expand=True)
 
-    def _play_selected(self, *_):
-        if not getattr(self, "_log_paths", None):
+        ttk.Label(wrap, text="Select input device for recording:").pack(anchor="w")
+
+        cols = ("index", "name", "sr_default", "max_in")
+        tree = ttk.Treeview(wrap, columns=cols, show="headings", height=10)
+        for c, label in zip(cols, ["Index", "Name", "Default SR", "Max In Ch"]):
+            tree.heading(c, text=label)
+            tree.column(c, width=120 if c != "name" else 360)
+        tree.pack(fill=tk.BOTH, expand=True, pady=(6, 6))
+
+        devices = list_input_devices()
+        for d in devices:
+            tree.insert("", tk.END, values=(d["index"], d["name"], d["sr_default"], d["max_in"]))
+
+        cur_idx = self.cfg.get("device_index", None)
+        if cur_idx is not None:
+            for iid in tree.get_children():
+                vals = tree.item(iid, "values")
+                if str(vals[0]) == str(cur_idx):
+                    tree.selection_set(iid)
+                    tree.see(iid)
+                    break
+
+        def save_sel():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Devices", "Select a device row first.")
+                return
+            vals = tree.item(sel[0], "values")
+            dev_index = int(vals[0])
+            self.cfg["device_index"] = dev_index
+            save_config(self.cfg)
+            messagebox.showinfo("Devices", f"Selected input device #{dev_index}\n\n{vals[1]}")
+
+        ttk.Button(wrap, text="Use selected device", command=save_sel).pack(anchor="e")
+
+        ttk.Label(wrap, text=f"Current: device_index={self.cfg.get('device_index')}, sr={self.cfg.get('samplerate')}, ch={self.cfg.get('channels')}",
+                  foreground="#666").pack(anchor="w", pady=(8,0))
+
+    # ----- Top bar actions -----
+    def _on_record(self):
+        if self.recording:
             return
+        if _IMPORT_ERR:
+            messagebox.showerror("Audio", f"sounddevice import error:\n{_IMPORT_ERR}")
+            return
+        try:
+            self.recorder = Recorder(
+                samplerate=self.cfg.get("samplerate", DEFAULT_SR),
+                channels=self.cfg.get("channels", DEFAULT_CH),
+                dtype=self.cfg.get("dtype", DEFAULT_DTYPE),
+                device_index=self.cfg.get("device_index", None)
+            )
+            self.recorder.start()
+            self.recording = True
+            self.btn_record.config(state=tk.DISABLED)
+            self.btn_stop.config(state=tk.NORMAL)
+            self.status_var.set("Recording…")
+        except Exception as e:
+            messagebox.showerror("Record", f"Failed to start:\n{e}")
+
+    def _on_stop(self):
+        if not self.recording:
+            return
+        try:
+            path, dur = self.recorder.stop()
+            self.recording = False
+            self.btn_record.config(state=tk.NORMAL)
+            self.btn_stop.config(state=tk.DISABLED)
+            self._refresh_logs()
+            self.status_var.set("Saved")
+            messagebox.showinfo("Saved", f"Saved:\n{path}\n\nDuration: {dur:.1f}s\nSidecar: {os.path.basename(path).replace('.wav','.json')}")
+        except Exception as e:
+            messagebox.showerror("Stop", f"Failed to stop/save:\n{e}")
+
+    def _on_play_last(self):
+        p = latest_wav()
+        if not p:
+            messagebox.showinfo("Play", "No recordings yet.")
+            return
+        play_wav(p)
+
+    # ----- Logs actions -----
+    def _selected_path(self):
+        if not hasattr(self, "logs_list"):
+            return None
         sel = self.logs_list.curselection()
         if not sel:
-            return
-        path = self._log_paths[sel[0]]
-        try:
-            if sys.platform == "darwin":
-                subprocess.Popen(["afplay", path])
-            elif sys.platform.startswith("win"):
-                os.startfile(path)  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["aplay", path])
-        except Exception as e:
-            self.set_status(f"Couldn't play: {e}")
+            return None
+        name = self.logs_list.get(sel[0]).split()[0]
+        return os.path.join(REC_DIR, name)
 
-    def _open_folder(self):
-        folder = REC_DIR
+    def _on_play_selected(self):
+        p = self._selected_path()
+        if p and os.path.exists(p):
+            play_wav(p)
+
+    def _on_reveal_selected(self):
+        p = self._selected_path()
+        if not p: return
         if sys.platform == "darwin":
-            subprocess.Popen(["open", folder])
-        elif sys.platform.startswith("win"):
-            os.startfile(folder)  # type: ignore[attr-defined]
+            subprocess.Popen(["open", "-R", p])
+        elif sys.platform.startswith("linux"):
+            subprocess.Popen(["xdg-open", os.path.dirname(p)])
         else:
-            subprocess.Popen(["xdg-open", folder])
+            messagebox.showinfo("Reveal", os.path.dirname(p))
 
+    # ----- Transcribe (NEW) -----
+    def _on_transcribe_selected(self):
+        p = self._selected_path()
+        if not p:
+            messagebox.showinfo("Transcribe", "Select a recording first.")
+            return
+        if not os.path.exists(p):
+            messagebox.showerror("Transcribe", "File not found on disk.")
+            return
 
+        try:
+            self.btn_transcribe.config(state=tk.DISABLED)
+        except Exception:
+            pass
+        self.status_var.set("Transcribing…")
+        threading.Thread(target=self._transcribe_worker, args=(p,), daemon=True).start()
+
+    def _transcribe_worker(self, wav_path: str):
+        try:
+            try:
+                from faster_whisper import WhisperModel
+            except Exception:
+                self.after(0, lambda: messagebox.showerror(
+                    "Transcribe",
+                    "faster-whisper is not installed.\n\n"
+                    "In Terminal run:\n"
+                    "source .venv/bin/activate && python3 -m pip install faster-whisper==1.0.3"
+                ))
+                return
+
+            model_size = os.environ.get("MELLOW_WHISPER_SIZE", "base")
+            compute_type = os.environ.get("MELLOW_WHISPER_COMPUTE", "int8")  # or "float32"
+            model = WhisperModel(model_size, device="cpu", compute_type=compute_type)
+
+            segments, info = model.transcribe(wav_path, language=None, vad_filter=True)
+
+            txt_out = wav_path.replace(".wav", ".txt")
+            with open(txt_out, "w", encoding="utf-8") as f:
+                for seg in segments:
+                    line = seg.text.strip()
+                    if line:
+                        f.write(line + "\n")
+
+            meta = {
+                "source": os.path.basename(wav_path),
+                "model": model_size,
+                "language": getattr(info, "language", None),
+                "duration": getattr(info, "duration", None),
+                "created_at": iso_now(),
+            }
+            with open(wav_path.replace(".wav", ".transcribe.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+
+            def done():
+                self.status_var.set("Transcribed")
+                messagebox.showinfo("Transcribe", f"Transcript saved:\n{txt_out}")
+                if sys.platform == "darwin":
+                    try:
+                        subprocess.Popen(["open", txt_out])
+                    except Exception:
+                        pass
+            self.after(0, done)
+
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Transcribe", f"Failed: {e}"))
+        finally:
+            try:
+                self.after(0, lambda: self.btn_transcribe.config(state=tk.NORMAL))
+            except Exception:
+                pass
+
+    # ----- periodic UI updates -----
+    def _tick(self):
+        if self.recording and self.recorder:
+            elapsed, rms = self.recorder.poll_into_buffer()
+            m = int(elapsed // 60)
+            s = int(elapsed % 60)
+            self.lbl_timer.config(text=f"{m:02d}:{s:02d}")
+            self.rms_var.set(max(0.0, min(1.0, rms)))
+        self.after(100, self._tick)
+
+# -----------------------
+# Main
+# -----------------------
 if __name__ == "__main__":
-    App().mainloop()
+    if _IMPORT_ERR:
+        print("Warning: sounddevice failed to import:", _IMPORT_ERR, file=sys.stderr)
+        print("UI will launch but recording won't work.", file=sys.stderr)
+    app = App()
+    app.mainloop()
